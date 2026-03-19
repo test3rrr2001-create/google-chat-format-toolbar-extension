@@ -2,30 +2,20 @@
   'use strict';
 
   /**********************************************************************
-   * Google Chat Format Toolbar Auto Open On Composer Click
-   *
-   * 目的:
-   * - Google Chat の chat入力欄をクリックした時に、
-   *   書式設定ツールバーが閉じていれば自動で開く
+   * Google Chat Format Toolbar Auto Open
+   * Trigger: user click / focus / keydown near chat composer
    *
    * 方針:
-   * - 常時無理に開こうとしない
-   * - 入力欄クリックをトリガーにする
-   * - すでに開いていれば何もしない
-   * - 短い cooldown を入れて連打/ループを防ぐ
-   *
-   * DOM変更時に見直す場所:
-   * 1. isComposerElement()
-   * 2. findComposerRoot()
-   * 3. isLikelyFormatButton()
-   * 4. isToolbarLikelyOpen()
+   * - クリック後に「現在の composer」を再探索してから開く
+   * - クリック対象が wrapper でも動くようにする
+   * - ただしループ防止のため cooldown を入れる
    **********************************************************************/
 
   const DEBUG = false;
-  const LOG_PREFIX = '[GChatFormatOnClick]';
+  const LOG_PREFIX = '[GChatFormatAutoOpen]';
 
-  const CLICK_DELAY_MS = 100;
-  const COOLDOWN_MS = 800;
+  const POST_CLICK_DELAY_MS = 120;
+  const COOLDOWN_MS = 900;
 
   let lastAutoOpenAt = 0;
   let lastHandledComposerRoot = null;
@@ -42,46 +32,51 @@
 
   function isVisible(el) {
     if (!(el instanceof HTMLElement)) return false;
+
     const style = window.getComputedStyle(el);
     if (style.display === 'none' || style.visibility === 'hidden') return false;
     if (el.offsetWidth <= 0 || el.offsetHeight <= 0) return false;
+
     return true;
   }
 
   /**
-   * Google Chat の入力欄かどうか判定する。
-   * DOMが変わった場合はここを見直す。
+   * 現在アクティブな composer を探す。
+   * まず activeElement ベースで探し、
+   * ダメなら visible な textbox/contenteditable 候補の末尾を採用する。
    */
-  function isComposerElement(el) {
-    if (!(el instanceof HTMLElement)) return false;
+  function findCurrentComposer() {
+    const active = document.activeElement;
 
-    const role = el.getAttribute('role');
-    const contentEditable = el.getAttribute('contenteditable');
+    if (active instanceof HTMLElement) {
+      const fromActive = active.closest(
+        '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
+      );
+      if (fromActive instanceof HTMLElement && isVisible(fromActive)) {
+        return fromActive;
+      }
+    }
 
-    return (
-      role === 'textbox' ||
-      contentEditable === 'true' ||
-      contentEditable === 'plaintext-only'
-    );
-  }
+    const candidates = Array.from(
+      document.querySelectorAll(
+        '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
+      )
+    ).filter((el) => el instanceof HTMLElement && isVisible(el));
 
-  function findComposerFromTarget(target) {
-    if (!(target instanceof HTMLElement)) return null;
-    return target.closest(
-      '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
-    );
+    if (candidates.length === 0) return null;
+
+    return candidates[candidates.length - 1];
   }
 
   /**
-   * composer 周辺の root を探す。
-   * 書式設定ボタンや toolbar をこの範囲から探す。
+   * composer 周辺の入力エリア root を探す。
    */
   function findComposerRoot(composer) {
     if (!(composer instanceof HTMLElement)) return null;
 
     let node = composer;
 
-    for (let i = 0; i < 7 && node; i += 1) {
+    for (let i = 0; i < 8 && node; i += 1) {
       const parent = node.parentElement;
       if (!parent) break;
 
@@ -98,6 +93,10 @@
     return node;
   }
 
+  /**
+   * Google Chat の書式設定ボタン判定。
+   * 将来文言変更があれば keywords を修正。
+   */
   function isLikelyFormatButton(el) {
     if (!(el instanceof HTMLElement)) return false;
     if (!isVisible(el)) return false;
@@ -154,17 +153,14 @@
   }
 
   /**
-   * 既に toolbar が開いているかの推定。
-   * ここで true なら click しない。
+   * 既に書式ツールバーが開いているかを推定。
    */
   function isToolbarLikelyOpen(root, button) {
     if (!(root instanceof HTMLElement)) return false;
 
     if (button instanceof HTMLElement) {
       const expanded = button.getAttribute('aria-expanded');
-      if (expanded === 'true') {
-        return true;
-      }
+      if (expanded === 'true') return true;
 
       const controlsId = button.getAttribute('aria-controls');
       if (controlsId) {
@@ -180,7 +176,7 @@
       return true;
     }
 
-    const richButtons = Array.from(root.querySelectorAll('button,[role="button"]')).filter((el) => {
+    const formattingButtons = Array.from(root.querySelectorAll('button,[role="button"]')).filter((el) => {
       if (el === button) return false;
       if (!(el instanceof HTMLElement) || !isVisible(el)) return false;
 
@@ -199,7 +195,7 @@
       ].some((keyword) => label.includes(keyword));
     });
 
-    return richButtons.length >= 2;
+    return formattingButtons.length >= 2;
   }
 
   function isCooldownActive(root) {
@@ -216,81 +212,84 @@
     return false;
   }
 
-  function tryOpenToolbarForComposer(composer) {
-    if (!(composer instanceof HTMLElement)) return;
+  function tryOpenToolbarFromCurrentComposer() {
+    const composer = findCurrentComposer();
+    if (!(composer instanceof HTMLElement)) {
+      log('No current composer found.');
+      return;
+    }
 
     const root = findComposerRoot(composer) || composer;
     if (!(root instanceof HTMLElement)) return;
 
     const button = findFormatButtonInRoot(root);
     if (!(button instanceof HTMLElement)) {
-      log('No format button found near composer.');
+      log('No format button found near current composer.');
       return;
     }
 
     if (isToolbarLikelyOpen(root, button)) {
-      log('Toolbar already open; skip.');
+      log('Toolbar already open.');
       return;
     }
 
     if (isCooldownActive(root)) {
-      log('Cooldown active; skip.');
+      log('Cooldown active.');
       return;
     }
 
-    window.setTimeout(() => {
-      if (!document.contains(root) || !document.contains(button)) {
-        return;
-      }
+    lastAutoOpenAt = Date.now();
+    lastHandledComposerRoot = root;
 
-      if (isToolbarLikelyOpen(root, button)) {
-        return;
-      }
+    log('Clicking format button.', {
+      label: button.getAttribute('aria-label') || button.getAttribute('title')
+    });
 
-      lastAutoOpenAt = Date.now();
-      lastHandledComposerRoot = root;
-
-      log('Clicking format button because composer was clicked.', {
-        label: button.getAttribute('aria-label') || button.getAttribute('title')
-      });
-
-      button.click();
-    }, CLICK_DELAY_MS);
+    button.click();
   }
 
-  function handleComposerInteraction(target) {
-    const composer = findComposerFromTarget(target);
-    if (!(composer instanceof HTMLElement)) return;
-    if (!isVisible(composer)) return;
-
-    tryOpenToolbarForComposer(composer);
+  /**
+   * クリックや focus の後、少し待ってから composer を再探索する。
+   * これで wrapperクリックでも反応しやすくなる。
+   */
+  function scheduleTryOpen() {
+    window.setTimeout(() => {
+      tryOpenToolbarFromCurrentComposer();
+    }, POST_CLICK_DELAY_MS);
   }
 
   function boot() {
-    log('Booting composer-click-triggered format toolbar opener.');
+    log('Booting click-triggered Google Chat format opener.');
 
     document.addEventListener(
       'click',
-      (event) => {
-        const target = event.target;
-        if (!(target instanceof HTMLElement)) return;
-
-        handleComposerInteraction(target);
+      () => {
+        scheduleTryOpen();
       },
       true
     );
 
     document.addEventListener(
       'focusin',
+      () => {
+        scheduleTryOpen();
+      },
+      true
+    );
+
+    document.addEventListener(
+      'keydown',
       (event) => {
         const target = event.target;
         if (!(target instanceof HTMLElement)) return;
 
-        const composer = findComposerFromTarget(target);
-        if (!(composer instanceof HTMLElement)) return;
+        const isInputLike = !!target.closest(
+          '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
+        );
 
-        // キーボード移動等でも開けたいので focusin でも同様に試す
-        tryOpenToolbarForComposer(composer);
+        if (isInputLike) {
+          scheduleTryOpen();
+        }
       },
       true
     );
