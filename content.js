@@ -4,37 +4,30 @@
   /**********************************************************************
    * Google Chat Always Open Format Toolbar
    *
-   * 対象:
-   * - Google Chat 専用: https://chat.google.com/*
-   *
    * 目的:
-   * - メッセージ入力欄の「書式設定ツールバー（Aボタン）」を
+   * - Google Chat のメッセージ入力欄の「書式設定ツールバー」を
    *   常に開いた状態に保つ
    *
-   * 実装方針:
-   * - CSSで無理やり表示はしない
-   * - 「書式設定ボタンが閉じている」ことを検知して click() する
-   * - Google ChatはSPAなので MutationObserver で再監視する
-   *
-   * 仕様変更時に見直すべき場所:
-   * 1. findFormatButtons()
-   * 2. isLikelyFormatButtonByLabel()
-   * 3. isToolbarAlreadyOpenNearButton()
-   *
-   * クラス名には依存せず、aria-label / aria-expanded / role など
-   * 比較的変わりにくい属性を優先して使う
+   * 今回の改善点:
+   * - 開閉ループ防止
+   * - 現在アクティブな composer 周辺だけを対象にする
+   * - click後のクールダウンを長めにする
+   * - toolbar が存在するなら絶対に再クリックしない
    **********************************************************************/
 
   const DEBUG = false;
   const LOG_PREFIX = '[GChatFormatAutoOpen]';
-  const DEBOUNCE_MS = 150;
-  const RETRY_AFTER_CLICK_MS = 250;
-  const PERIODIC_CHECK_MS = 2000;
+
+  const DEBOUNCE_MS = 180;
+  const CLICK_COOLDOWN_MS = 1200;
+  const PERIODIC_CHECK_MS = 4000;
 
   let observer = null;
   let debounceTimer = null;
   let periodicTimer = null;
+
   let lastClickAt = 0;
+  let lastFocusedComposer = null;
 
   function log(...args) {
     if (DEBUG) {
@@ -46,12 +39,75 @@
     return (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
+  function isVisible(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (el.offsetWidth <= 0 || el.offsetHeight <= 0) return false;
+    return true;
+  }
+
   /**
-   * Google Chat の書式設定ボタンを aria-label / title / tooltip から判定する。
-   *
-   * 将来 Google 側の文言が変わったら、
-   * keywords 配列を修正してください。
+   * 編集中の入力欄らしい要素を探す。
+   * Google Chat は contenteditable な composer を使うことが多いので、
+   * role=textbox や contenteditable を優先して探す。
    */
+  function findActiveComposer() {
+    const active = document.activeElement;
+
+    if (active instanceof HTMLElement) {
+      const composerFromActive = active.closest(
+        '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
+      );
+      if (composerFromActive instanceof HTMLElement) {
+        lastFocusedComposer = composerFromActive;
+        return composerFromActive;
+      }
+    }
+
+    if (lastFocusedComposer && document.contains(lastFocusedComposer)) {
+      return lastFocusedComposer;
+    }
+
+    const candidates = Array.from(
+      document.querySelectorAll(
+        '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
+      )
+    ).filter((el) => el instanceof HTMLElement && isVisible(el));
+
+    if (candidates.length > 0) {
+      lastFocusedComposer = candidates[candidates.length - 1];
+      return lastFocusedComposer;
+    }
+
+    return null;
+  }
+
+  /**
+   * composer からその周辺の入力エリアコンテナを探す。
+   * ここを root にしてボタンや toolbar を探すことで、
+   * 画面上の別 composer 候補への誤爆を減らす。
+   */
+  function findComposerRoot(composer) {
+    if (!(composer instanceof HTMLElement)) return null;
+
+    let node = composer;
+    for (let i = 0; i < 6 && node; i += 1) {
+      const parent = node.parentElement;
+      if (!parent) break;
+
+      const hasButtons = parent.querySelectorAll('button, [role="button"]').length;
+      const width = parent.offsetWidth;
+      if (hasButtons >= 2 && width > 200) {
+        node = parent;
+      } else {
+        break;
+      }
+    }
+
+    return node;
+  }
+
   function isLikelyFormatButtonByLabel(el) {
     if (!(el instanceof HTMLElement)) return false;
 
@@ -75,22 +131,6 @@
     return texts.some((text) => keywords.some((keyword) => text.includes(keyword)));
   }
 
-  /**
-   * SVGベースの判定用フック。
-   *
-   * 現状は誤検知防止のため使っていませんが、
-   * Google Chat側の aria-label が変わった場合は
-   * ここに Aアイコンの path 判定を追加できます。
-   */
-  function isLikelyFormatButtonBySvg(el) {
-    if (!(el instanceof HTMLElement)) return false;
-
-    const svg = el.querySelector('svg');
-    if (!svg) return false;
-
-    return false;
-  }
-
   function isLikelyFormatButton(el) {
     if (!(el instanceof HTMLElement)) return false;
 
@@ -101,17 +141,14 @@
       typeof el.click === 'function';
 
     if (!isButtonLike) return false;
+    if (!isVisible(el)) return false;
 
-    return isLikelyFormatButtonByLabel(el) || isLikelyFormatButtonBySvg(el);
+    return isLikelyFormatButtonByLabel(el);
   }
 
-  /**
-   * 書式設定ボタン候補を列挙する。
-   *
-   * Google ChatのDOM変更時は、まずここを見直してください。
-   * クラス名ではなく、button / role=button と aria系属性を使います。
-   */
-  function findFormatButtons() {
+  function findFormatButtonInRoot(root) {
+    if (!(root instanceof HTMLElement)) return null;
+
     const selector = [
       'button[aria-label]',
       'button[title]',
@@ -121,119 +158,108 @@
       '[role="button"][data-tooltip]'
     ].join(',');
 
-    return Array.from(document.querySelectorAll(selector)).filter(isLikelyFormatButton);
-  }
+    const buttons = Array.from(root.querySelectorAll(selector)).filter(isLikelyFormatButton);
 
-  function isVisible(el) {
-    if (!(el instanceof HTMLElement)) return false;
+    // aria-expanded を持つものを優先
+    buttons.sort((a, b) => {
+      const aExpanded = a.hasAttribute('aria-expanded') ? 1 : 0;
+      const bExpanded = b.hasAttribute('aria-expanded') ? 1 : 0;
+      return bExpanded - aExpanded;
+    });
 
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-    if (el.offsetWidth <= 0 || el.offsetHeight <= 0) return false;
-
-    return true;
+    return buttons[0] || null;
   }
 
   /**
-   * ボタン近傍に書式ツールバーが既に開いているかを判定する。
-   *
-   * 優先判定:
-   * - aria-expanded="true"
-   * - aria-controls の参照先が存在
-   *
-   * 保険:
-   * - 周辺に role="toolbar" があるか
-   * - 太字/斜体/下線など、書式系のボタン群が周辺にあるか
+   * toolbar が既に開いているかを、composer root 内だけで判定する。
+   * ここが甘いと開閉ループになるので、かなり慎重に false を返す。
    */
-  function isToolbarAlreadyOpenNearButton(button) {
-    if (!(button instanceof HTMLElement)) return false;
+  function isToolbarOpenInRoot(root, button) {
+    if (!(root instanceof HTMLElement)) return false;
 
-    const expanded = button.getAttribute('aria-expanded');
-    if (expanded === 'true') {
+    if (button instanceof HTMLElement) {
+      const expanded = button.getAttribute('aria-expanded');
+      if (expanded === 'true') {
+        return true;
+      }
+
+      const controlsId = button.getAttribute('aria-controls');
+      if (controlsId) {
+        const controlled = document.getElementById(controlsId);
+        if (controlled && isVisible(controlled)) {
+          return true;
+        }
+      }
+    }
+
+    const toolbar = root.querySelector('[role="toolbar"]');
+    if (toolbar && isVisible(toolbar)) {
       return true;
     }
 
-    const controlsId = button.getAttribute('aria-controls');
-    if (controlsId) {
-      const controlled = document.getElementById(controlsId);
-      if (controlled) return true;
-    }
+    const richButtons = Array.from(root.querySelectorAll('button,[role="button"]')).filter((el) => {
+      if (el === button) return false;
+      if (!(el instanceof HTMLElement) || !isVisible(el)) return false;
 
-    const searchRoots = [];
-    if (button.parentElement) searchRoots.push(button.parentElement);
-    if (button.parentElement?.parentElement) searchRoots.push(button.parentElement.parentElement);
-    if (button.closest('form')) searchRoots.push(button.closest('form'));
+      const label = normalizeText(
+        el.getAttribute('aria-label') ||
+        el.getAttribute('title') ||
+        el.getAttribute('data-tooltip') ||
+        el.textContent
+      );
 
-    for (const root of searchRoots) {
-      if (!(root instanceof HTMLElement)) continue;
+      return [
+        'bold', 'italic', 'underline',
+        '太字', '斜体', '下線',
+        'bulleted', 'numbered',
+        '箇条書き', '番号付き'
+      ].some((keyword) => label.includes(keyword));
+    });
 
-      const toolbar = root.querySelector('[role="toolbar"]');
-      if (toolbar) return true;
-
-      const richControls = Array.from(root.querySelectorAll('button,[role="button"]')).filter((el) => {
-        if (el === button) return false;
-
-        const label = normalizeText(
-          el.getAttribute('aria-label') ||
-          el.getAttribute('title') ||
-          el.getAttribute('data-tooltip') ||
-          el.textContent
-        );
-
-        return [
-          'bold', 'italic', 'underline',
-          '太字', '斜体', '下線',
-          'bulleted', 'numbered',
-          '箇条書き', '番号付き'
-        ].some((keyword) => label.includes(keyword));
-      });
-
-      if (richControls.length >= 2) {
-        return true;
-      }
-    }
-
-    return false;
+    return richButtons.length >= 2;
   }
 
-  /**
-   * 閉じている書式設定ボタンを見つけて click() する。
-   */
+  function shouldSkipBecauseCooldown() {
+    return Date.now() - lastClickAt < CLICK_COOLDOWN_MS;
+  }
+
   function ensureToolbarOpen() {
-    const now = Date.now();
-
-    if (now - lastClickAt < 120) {
+    const composer = findActiveComposer();
+    if (!(composer instanceof HTMLElement)) {
+      log('No active composer found.');
       return;
     }
 
-    const buttons = findFormatButtons();
-    if (buttons.length === 0) {
-      log('No format button found.');
+    const root = findComposerRoot(composer) || composer;
+    const button = findFormatButtonInRoot(root);
+
+    if (!(button instanceof HTMLElement)) {
+      log('No format button found near active composer.');
       return;
     }
 
-    for (const button of buttons) {
-      if (!isVisible(button)) continue;
+    const open = isToolbarOpenInRoot(root, button);
 
-      const alreadyOpen = isToolbarAlreadyOpenNearButton(button);
-      log('Format button check:', {
-        ariaLabel: button.getAttribute('aria-label'),
-        expanded: button.getAttribute('aria-expanded'),
-        alreadyOpen
-      });
+    log('Composer check:', {
+      composer,
+      root,
+      buttonLabel: button.getAttribute('aria-label') || button.getAttribute('title'),
+      expanded: button.getAttribute('aria-expanded'),
+      open,
+      cooldown: shouldSkipBecauseCooldown()
+    });
 
-      if (!alreadyOpen) {
-        lastClickAt = Date.now();
-        log('Clicking format button.', button);
-        button.click();
-
-        window.setTimeout(() => {
-          scheduleEnsureToolbarOpen();
-        }, RETRY_AFTER_CLICK_MS);
-
-        return;
-      }
+    if (open) {
+      return;
     }
+
+    if (shouldSkipBecauseCooldown()) {
+      return;
+    }
+
+    lastClickAt = Date.now();
+    log('Clicking format button to open toolbar.', button);
+    button.click();
   }
 
   function scheduleEnsureToolbarOpen() {
@@ -246,10 +272,6 @@
     }, DEBOUNCE_MS);
   }
 
-  /**
-   * Google Chat はSPAなので、
-   * ルーム移動・送信後・入力欄再生成などを MutationObserver で監視する。
-   */
   function startObserver() {
     if (!document.body) return;
 
@@ -297,9 +319,6 @@
     });
   }
 
-  /**
-   * MutationObserver だけでは拾いきれないケース向けの保険。
-   */
   function startPeriodicCheck() {
     if (periodicTimer) {
       clearInterval(periodicTimer);
@@ -314,17 +333,42 @@
     log('Booting Google Chat format-toolbar auto-open extension.');
     startObserver();
     startPeriodicCheck();
+
     scheduleEnsureToolbarOpen();
 
-    window.addEventListener('focus', scheduleEnsureToolbarOpen, true);
+    document.addEventListener(
+      'focusin',
+      (event) => {
+        const target = event.target;
+        if (target instanceof HTMLElement) {
+          const composer = target.closest(
+            '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
+          );
+          if (composer instanceof HTMLElement) {
+            lastFocusedComposer = composer;
+            scheduleEnsureToolbarOpen();
+          }
+        }
+      },
+      true
+    );
 
-    document.addEventListener('click', () => {
-      scheduleEnsureToolbarOpen();
-    }, true);
+    document.addEventListener(
+      'click',
+      (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
 
-    document.addEventListener('keyup', () => {
-      scheduleEnsureToolbarOpen();
-    }, true);
+        const composer = target.closest(
+          '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
+        );
+        if (composer instanceof HTMLElement) {
+          lastFocusedComposer = composer;
+          scheduleEnsureToolbarOpen();
+        }
+      },
+      true
+    );
   }
 
   if (document.readyState === 'loading') {
