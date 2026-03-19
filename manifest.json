@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Google Chat Always Open Format Toolbar",
+  "version": "1.0.0",
+  "description": "Google Chatの書式設定ツールバーを常に開いた状態に保つChrome拡張です。",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.google.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
