@@ -4,29 +4,40 @@
   /**********************************************************************
    * Google Chat Always Open Format Toolbar
    *
-   * 安定化方針:
-   * - 同じ composer（入力欄インスタンス）には自動クリックを1回だけ行う
-   * - composer が作り直された時だけ、新しい composer に対して再度1回だけ開く
+   * 目的:
+   * - Google Chat でルーム遷移後も書式設定ツールバーを自動再オープンする
+   * - ただし開閉ループは防ぐ
    *
-   * これにより、Google Chat のDOM揺れによる
-   * 「開く→また click → 閉じる」のループを防ぐ
+   * 設計:
+   * - 同じ composer root には自動クリックを1回だけ
+   * - URL（ルーム）が変わったら、その記録をリセット
+   * - 新ルームの composer に対して再度1回だけ自動クリック
+   *
+   * Google側DOM変更時に見直す場所:
+   * 1. findActiveComposer()
+   * 2. findComposerRoot()
+   * 3. isLikelyFormatButton()
+   * 4. findFormatButtonInRoot()
    **********************************************************************/
 
   const DEBUG = false;
   const LOG_PREFIX = '[GChatFormatAutoOpen]';
 
   const DEBOUNCE_MS = 180;
-  const PERIODIC_CHECK_MS = 3000;
+  const PERIODIC_CHECK_MS = 2500;
   const CLICK_DELAY_MS = 120;
+  const URL_WATCH_MS = 500;
 
   let observer = null;
   let debounceTimer = null;
   let periodicTimer = null;
-
-  // 既に自動クリックした composer root を記録
-  const autoOpenedComposerRoots = new WeakSet();
+  let urlWatchTimer = null;
 
   let lastFocusedComposer = null;
+  let currentRouteKey = location.pathname + location.search + location.hash;
+
+  // 現在のルーム/URL単位で「既に自動オープンした composer root」を管理
+  let autoOpenedComposerRoots = new WeakSet();
 
   function log(...args) {
     if (DEBUG) {
@@ -46,9 +57,36 @@
     return true;
   }
 
+  function getRouteKey() {
+    return location.pathname + location.search + location.hash;
+  }
+
+  function resetRouteState(reason) {
+    autoOpenedComposerRoots = new WeakSet();
+    lastFocusedComposer = null;
+    currentRouteKey = getRouteKey();
+    log('Route state reset:', reason, currentRouteKey);
+
+    // ルーム遷移後、新composer描画のため少し待ってから確認
+    window.setTimeout(() => {
+      scheduleEnsureToolbarOpen();
+    }, 250);
+
+    window.setTimeout(() => {
+      scheduleEnsureToolbarOpen();
+    }, 800);
+  }
+
+  function onPotentialRouteChange(source) {
+    const nextRouteKey = getRouteKey();
+    if (nextRouteKey !== currentRouteKey) {
+      resetRouteState(source);
+    }
+  }
+
   /**
    * 現在使われている composer を探す。
-   * Google Chat では contenteditable / role=textbox が使われることが多い。
+   * Google Chat は role=textbox / contenteditable を使うことが多い。
    */
   function findActiveComposer() {
     const active = document.activeElement;
@@ -74,7 +112,6 @@
     ).filter((el) => el instanceof HTMLElement && isVisible(el));
 
     if (candidates.length > 0) {
-      // 末尾の候補を優先すると、現在表示中の composer を拾いやすい
       lastFocusedComposer = candidates[candidates.length - 1];
       return lastFocusedComposer;
     }
@@ -84,7 +121,7 @@
 
   /**
    * composer 周辺の root を探す。
-   * この root 単位で「既に自動で開いたか」を記録する。
+   * この root 単位で「既に自動クリックしたか」を管理する。
    */
   function findComposerRoot(composer) {
     if (!(composer instanceof HTMLElement)) return null;
@@ -98,7 +135,7 @@
       const width = parent.offsetWidth;
       const buttonCount = parent.querySelectorAll('button, [role="button"]').length;
 
-      if (width > 200 && buttonCount >= 2) {
+      if (width > 220 && buttonCount >= 2) {
         node = parent;
       } else {
         break;
@@ -154,7 +191,6 @@
 
     const buttons = Array.from(root.querySelectorAll(selector)).filter(isLikelyFormatButton);
 
-    // aria-expanded を持つものを優先
     buttons.sort((a, b) => {
       const aScore = a.hasAttribute('aria-expanded') ? 1 : 0;
       const bScore = b.hasAttribute('aria-expanded') ? 1 : 0;
@@ -165,9 +201,9 @@
   }
 
   /**
-   * 既に toolbar が開いているなら click しない。
-   * ただし、今回の本丸は「同じcomposerへの複数クリック禁止」なので、
-   * この判定は補助的な安全装置として扱う。
+   * toolbar が開いているかの補助判定。
+   * ここに完全依存しないようにしているが、
+   * 開いている時に余計な click を避けるための安全装置として使う。
    */
   function isToolbarLikelyOpen(root, button) {
     if (!(root instanceof HTMLElement)) return false;
@@ -179,7 +215,9 @@
       const controlsId = button.getAttribute('aria-controls');
       if (controlsId) {
         const controlled = document.getElementById(controlsId);
-        if (controlled && isVisible(controlled)) return true;
+        if (controlled && isVisible(controlled)) {
+          return true;
+        }
       }
     }
 
@@ -211,10 +249,12 @@
   }
 
   /**
-   * 現在の composer に対して、
-   * まだ一度も自動で開いていなければ1回だけ click する。
+   * 現在のルーム・現在の composer に対して、
+   * まだ自動クリックしていなければ1回だけ click する。
    */
   function ensureToolbarOpenForCurrentComposer() {
+    onPotentialRouteChange('ensure-check');
+
     const composer = findActiveComposer();
     if (!(composer instanceof HTMLElement)) {
       log('No active composer.');
@@ -222,13 +262,10 @@
     }
 
     const root = findComposerRoot(composer) || composer;
-    if (!(root instanceof HTMLElement)) {
-      return;
-    }
+    if (!(root instanceof HTMLElement)) return;
 
-    // 同じ composer root に対しては一度しか自動クリックしない
     if (autoOpenedComposerRoots.has(root)) {
-      log('Already auto-opened for this composer root. Skipping.');
+      log('Already handled for this route/root.');
       return;
     }
 
@@ -238,31 +275,41 @@
       return;
     }
 
-    // すでに開いているなら、クリックせず「開いた扱い」にして以後スキップ
+    // 開いていれば click せず handled 扱い
     if (isToolbarLikelyOpen(root, button)) {
       autoOpenedComposerRoots.add(root);
-      log('Toolbar already open. Marking composer root as handled.');
+      log('Toolbar already open. Marking handled.');
       return;
     }
 
     window.setTimeout(() => {
-      // timeout 後にまだ同じ root が存在するか確認
       if (!document.contains(root) || !document.contains(button)) {
         return;
       }
 
-      // timeout 中に別処理で開いていたら、それも handled にする
-      if (isToolbarLikelyOpen(root, button)) {
-        autoOpenedComposerRoots.add(root);
-        log('Toolbar became open before click. Marking as handled.');
+      // timeout後にルームが変わっていたら中止
+      if (getRouteKey() !== currentRouteKey) {
         return;
       }
 
-      log('Clicking format button once for this composer root.', button);
+      if (autoOpenedComposerRoots.has(root)) {
+        return;
+      }
+
+      if (isToolbarLikelyOpen(root, button)) {
+        autoOpenedComposerRoots.add(root);
+        log('Toolbar became open before click. Marking handled.');
+        return;
+      }
+
+      log('Clicking format button once for this route/root.', {
+        route: currentRouteKey,
+        buttonLabel: button.getAttribute('aria-label') || button.getAttribute('title')
+      });
+
       button.click();
 
-      // クリック成否に関わらず、同じ root では二度と自動クリックしない
-      // これがループ防止の本体
+      // ループ防止のため、同じ route + root では以後 click しない
       autoOpenedComposerRoots.add(root);
     }, CLICK_DELAY_MS);
   }
@@ -276,11 +323,6 @@
       ensureToolbarOpenForCurrentComposer();
     }, DEBOUNCE_MS);
   }
-
-  /**
-   * 不要になった composer root は WeakSet なので明示削除不要。
-   * DOMから消えればGC対象になる。
-   */
 
   function startObserver() {
     if (!document.body) return;
@@ -339,11 +381,45 @@
     }, PERIODIC_CHECK_MS);
   }
 
-  function boot() {
-    log('Booting stable Google Chat format-toolbar auto-open extension.');
+  function startUrlWatcher() {
+    if (urlWatchTimer) {
+      clearInterval(urlWatchTimer);
+    }
 
+    urlWatchTimer = window.setInterval(() => {
+      onPotentialRouteChange('interval-url-watch');
+    }, URL_WATCH_MS);
+  }
+
+  function patchHistoryMethods() {
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+
+    history.pushState = function (...args) {
+      const result = originalPushState.apply(this, args);
+      window.setTimeout(() => onPotentialRouteChange('pushState'), 0);
+      return result;
+    };
+
+    history.replaceState = function (...args) {
+      const result = originalReplaceState.apply(this, args);
+      window.setTimeout(() => onPotentialRouteChange('replaceState'), 0);
+      return result;
+    };
+
+    window.addEventListener('popstate', () => {
+      onPotentialRouteChange('popstate');
+    });
+  }
+
+  function boot() {
+    log('Booting route-aware Google Chat format-toolbar auto-open extension.');
+
+    patchHistoryMethods();
     startObserver();
     startPeriodicCheck();
+    startUrlWatcher();
+
     scheduleEnsureToolbarOpen();
 
     document.addEventListener(
@@ -377,7 +453,11 @@
         if (composer instanceof HTMLElement) {
           lastFocusedComposer = composer;
           scheduleEnsureToolbarOpen();
+          return;
         }
+
+        // ルーム一覧クリック時もURL変更前後で再評価したいので軽く予約
+        scheduleEnsureToolbarOpen();
       },
       true
     );
