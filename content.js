@@ -9,19 +9,21 @@
 
   const PREFIX = '[gchat-format-debug]';
   const LOG_COOLDOWN_MS = 1000;
-  const SEARCH_MARGIN = 260;
-  const MAX_CANDIDATES = 20;
+  const MAX_DEPTH = 12;
+  const MAX_PER_SCOPE = 12;
+  const MAX_GLOBAL = 40;
+  const NEAR_DISTANCE = 420;
 
   let lastLogAt = 0;
   let lastSignature = '';
   let seq = 0;
 
-  function isGoogleChat() {
-    return location.hostname === 'chat.google.com';
-  }
-
   function text(value) {
     return (value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isGoogleChat() {
+    return location.hostname === 'chat.google.com';
   }
 
   function isVisible(el) {
@@ -33,15 +35,47 @@
   }
 
   function isTextboxLike(el) {
+    return el instanceof Element
+      && el.matches('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]');
+  }
+
+  function centerOfRect(rect) {
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    };
+  }
+
+  function distanceBetweenRects(a, b) {
+    const ca = centerOfRect(a);
+    const cb = centerOfRect(b);
+    const dx = ca.x - cb.x;
+    const dy = ca.y - cb.y;
+    return Math.round(Math.sqrt(dx * dx + dy * dy));
+  }
+
+  function simplePath(el, limit = 5) {
     if (!(el instanceof Element)) {
-      return false;
+      return '';
     }
 
-    if (el.matches('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]')) {
-      return true;
+    const parts = [];
+    let node = el;
+    let depth = 0;
+
+    while (node && depth < limit) {
+      let part = node.tagName.toLowerCase();
+      const role = text(node.getAttribute('role'));
+      const ariaLabel = text(node.getAttribute('aria-label'));
+      if (node.id) part += `#${node.id}`;
+      if (role) part += `[role="${role}"]`;
+      if (ariaLabel) part += `[aria-label="${ariaLabel.slice(0, 24)}"]`;
+      parts.unshift(part);
+      node = node.parentElement;
+      depth += 1;
     }
 
-    return false;
+    return parts.join(' > ');
   }
 
   function findTextboxFromTarget(target) {
@@ -54,55 +88,42 @@
       return direct;
     }
 
-    const nearbyTextboxes = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]')]
+    const targetRect = target.getBoundingClientRect();
+    const nearestTextbox = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]')]
       .filter(isVisible)
       .map((el) => ({
         el,
-        distance: distanceBetween(el.getBoundingClientRect(), target.getBoundingClientRect()),
+        distance: distanceBetweenRects(targetRect, el.getBoundingClientRect()),
       }))
-      .sort((a, b) => a.distance - b.distance);
+      .sort((a, b) => a.distance - b.distance)[0];
 
-    return nearbyTextboxes[0]?.distance <= SEARCH_MARGIN ? nearbyTextboxes[0].el : null;
-  }
-
-  function findComposerRoot(textbox) {
-    if (!(textbox instanceof Element)) {
+    if (!nearestTextbox || nearestTextbox.distance > 260) {
       return null;
     }
 
-    let node = textbox;
-    for (let i = 0; i < 6 && node; i += 1) {
-      const buttonCount = node.querySelectorAll('button, [role="button"]').length;
-      const textboxCount = node.querySelectorAll('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]').length;
-      if (buttonCount > 0 && textboxCount > 0) {
-        return node;
-      }
+    return nearestTextbox.el;
+  }
+
+  function collectAncestorScopes(textbox) {
+    const scopes = [];
+    let node = textbox instanceof Element ? textbox : null;
+    let depth = 0;
+
+    while (node && depth < MAX_DEPTH) {
+      scopes.push({
+        depth,
+        node,
+        path: simplePath(node),
+      });
       node = node.parentElement;
+      depth += 1;
     }
 
-    return textbox.parentElement || textbox;
+    return scopes;
   }
 
-  function distanceBetween(a, b) {
-    const ax = a.left + a.width / 2;
-    const ay = a.top + a.height / 2;
-    const bx = b.left + b.width / 2;
-    const by = b.top + b.height / 2;
-    const dx = ax - bx;
-    const dy = ay - by;
-    return Math.round(Math.sqrt(dx * dx + dy * dy));
-  }
-
-  function intersectsExpandedRect(baseRect, candidateRect, margin = SEARCH_MARGIN) {
-    return !(
-      candidateRect.right < baseRect.left - margin ||
-      candidateRect.left > baseRect.right + margin ||
-      candidateRect.bottom < baseRect.top - margin ||
-      candidateRect.top > baseRect.bottom + margin
-    );
-  }
-
-  function scoreCandidate(button, textboxRect) {
+  function formatButtonData(button, textboxRect, source, scopeDepth = null, scopePath = '') {
+    const rect = button.getBoundingClientRect();
     const label = text(button.getAttribute('aria-label'));
     const title = text(button.getAttribute('title'));
     const tooltip = text(button.getAttribute('data-tooltip'));
@@ -110,18 +131,19 @@
     const expanded = text(button.getAttribute('aria-expanded'));
     const controls = text(button.getAttribute('aria-controls'));
     const combined = `${label} ${title} ${tooltip} ${bodyText}`.toLowerCase();
-    const rect = button.getBoundingClientRect();
-    const distance = distanceBetween(textboxRect, rect);
+    const distance = distanceBetweenRects(textboxRect, rect);
 
     let score = 0;
-    if (bodyText === 'A' || bodyText === 'a') score += 8;
+    if (bodyText === 'A' || bodyText === 'a') score += 10;
     if (/format|formatting|書式|書式設定|style/.test(combined)) score += 8;
-    if (expanded) score += 3;
-    if (controls) score += 3;
-    if (button.getAttribute('aria-haspopup')) score += 1;
-    score += Math.max(0, 6 - Math.floor(distance / 80));
+    if (expanded) score += 4;
+    if (controls) score += 4;
+    if (button.getAttribute('aria-haspopup')) score += 2;
+    score += Math.max(0, 8 - Math.floor(distance / 70));
 
     return {
+      source,
+      scopeDepth,
       score,
       distance,
       text: bodyText,
@@ -135,33 +157,61 @@
       tag: button.tagName.toLowerCase(),
       role: text(button.getAttribute('role')),
       className: text(button.className),
-      button,
+      path: simplePath(button),
+      scopePath,
+      element: button,
     };
   }
 
-  function collectCandidates(textbox, composerRoot) {
-    const textboxRect = textbox.getBoundingClientRect();
-    const scope = composerRoot || document.body;
-    const buttons = [...scope.querySelectorAll('button, [role="button"]')]
-      .filter(isVisible)
-      .filter((button) => intersectsExpandedRect(textboxRect, button.getBoundingClientRect()))
-      .map((button) => scoreCandidate(button, textboxRect))
-      .sort((a, b) => b.score - a.score || a.distance - b.distance)
-      .slice(0, MAX_CANDIDATES);
+  function collectScopeCandidates(scopes, textboxRect) {
+    const dedupe = new Map();
 
-    return buttons;
+    for (const scope of scopes) {
+      const buttons = [...scope.node.querySelectorAll('button, [role="button"]')]
+        .filter(isVisible)
+        .slice(0, 200);
+
+      for (const button of buttons) {
+        if (!dedupe.has(button)) {
+          dedupe.set(button, formatButtonData(button, textboxRect, 'ancestor-scope', scope.depth, scope.path));
+        }
+      }
+    }
+
+    return [...dedupe.values()]
+      .sort((a, b) => b.score - a.score || a.distance - b.distance)
+      .slice(0, MAX_GLOBAL);
   }
 
-  function makeSignature(textbox, composerRoot) {
-    const textboxRect = textbox.getBoundingClientRect();
-    const rootTag = composerRoot?.tagName?.toLowerCase() || 'none';
+  function collectNearbyGlobalCandidates(textboxRect, textbox) {
+    return [...document.querySelectorAll('button, [role="button"]')]
+      .filter(isVisible)
+      .filter((button) => button !== textbox && !button.contains(textbox))
+      .map((button) => formatButtonData(button, textboxRect, 'global-nearby'))
+      .filter((item) => item.distance <= NEAR_DISTANCE)
+      .sort((a, b) => b.score - a.score || a.distance - b.distance)
+      .slice(0, MAX_GLOBAL);
+  }
+
+  function collectLikelyFormatButtons(allCandidates) {
+    return allCandidates
+      .filter((item) => item.text === 'A'
+        || item.text === 'a'
+        || /format|formatting|書式|書式設定|style/i.test(`${item.ariaLabel} ${item.title} ${item.dataTooltip} ${item.text}`)
+        || !!item.ariaExpanded
+        || !!item.ariaControls)
+      .sort((a, b) => b.score - a.score || a.distance - b.distance)
+      .slice(0, MAX_PER_SCOPE);
+  }
+
+  function makeSignature(textbox) {
+    const rect = textbox.getBoundingClientRect();
     return [
       location.pathname,
-      rootTag,
-      Math.round(textboxRect.left),
-      Math.round(textboxRect.top),
-      Math.round(textboxRect.width),
-      Math.round(textboxRect.height),
+      Math.round(rect.left),
+      Math.round(rect.top),
+      Math.round(rect.width),
+      Math.round(rect.height),
     ].join('|');
   }
 
@@ -175,46 +225,46 @@
     return true;
   }
 
-  function debugComposer(target, trigger) {
+  function logDebug(target, trigger) {
     if (!isGoogleChat()) {
       return;
     }
 
     const textbox = findTextboxFromTarget(target);
-    if (!textbox || !isTextboxLike(textbox)) {
+    if (!isTextboxLike(textbox) || !isVisible(textbox)) {
       return;
     }
 
-    const composerRoot = findComposerRoot(textbox);
-    const signature = makeSignature(textbox, composerRoot);
+    const signature = makeSignature(textbox);
     if (!shouldLog(signature)) {
       return;
     }
 
-    const candidates = collectCandidates(textbox, composerRoot);
     const textboxRect = textbox.getBoundingClientRect();
+    const scopes = collectAncestorScopes(textbox);
+    const scopeCandidates = collectScopeCandidates(scopes, textboxRect);
+    const nearbyCandidates = collectNearbyGlobalCandidates(textboxRect, textbox);
+    const allCandidates = [...new Map([...scopeCandidates, ...nearbyCandidates].map((item) => [item.element, item])).values()]
+      .sort((a, b) => b.score - a.score || a.distance - b.distance);
+    const likelyFormatButtons = collectLikelyFormatButtons(allCandidates);
 
     seq += 1;
     console.group(`${PREFIX} #${seq} ${trigger}`);
     console.info('url:', location.href);
     console.info('textbox:', textbox);
-    console.info('composerRoot:', composerRoot);
+    console.info('textboxPath:', simplePath(textbox));
     console.info('textboxRect:', `${Math.round(textboxRect.left)},${Math.round(textboxRect.top)} ${Math.round(textboxRect.width)}x${Math.round(textboxRect.height)}`);
-    console.table(candidates.map((item) => ({
-      score: item.score,
-      distance: item.distance,
-      text: item.text,
-      ariaLabel: item.ariaLabel,
-      title: item.title,
-      dataTooltip: item.dataTooltip,
-      ariaExpanded: item.ariaExpanded,
-      ariaControls: item.ariaControls,
-      ariaHaspopup: item.ariaHaspopup,
-      rect: item.rect,
-      tag: item.tag,
-      role: item.role,
-      className: item.className,
-    })));
+    console.info('ancestorScopes:', scopes.map((scope) => ({ depth: scope.depth, path: scope.path })));
+    console.info('撤退判断目安: 入力欄を複数回クリックしても likelyFormatButtons が毎回 0 件なら、この方向は一旦撤退寄りで判断');
+    console.groupCollapsed('likelyFormatButtons');
+    console.table(likelyFormatButtons.map(({ element, ...rest }) => rest));
+    console.groupEnd();
+    console.groupCollapsed('scopeCandidates(top)');
+    console.table(scopeCandidates.slice(0, MAX_PER_SCOPE).map(({ element, ...rest }) => rest));
+    console.groupEnd();
+    console.groupCollapsed('nearbyCandidates(top)');
+    console.table(nearbyCandidates.slice(0, MAX_PER_SCOPE).map(({ element, ...rest }) => rest));
+    console.groupEnd();
     console.groupEnd();
 
     window.__gchatFormatDebugLast = {
@@ -222,8 +272,11 @@
       trigger,
       url: location.href,
       textbox,
-      composerRoot,
-      candidates: candidates.map(({ button, ...rest }) => rest),
+      textboxPath: simplePath(textbox),
+      ancestorScopes: scopes.map((scope) => ({ depth: scope.depth, path: scope.path })),
+      likelyFormatButtons: likelyFormatButtons.map(({ element, ...rest }) => rest),
+      scopeCandidates: scopeCandidates.map(({ element, ...rest }) => rest),
+      nearbyCandidates: nearbyCandidates.map(({ element, ...rest }) => rest),
     };
   }
 
@@ -234,8 +287,8 @@
     }
 
     window.setTimeout(() => {
-      debugComposer(target, event.type);
-    }, 120);
+      logDebug(target, event.type);
+    }, 140);
   }
 
   document.addEventListener('click', onInteraction, true);
