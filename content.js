@@ -1,303 +1,245 @@
 (() => {
   'use strict';
 
-  /**********************************************************************
-   * Google Chat Format Toolbar Auto Open
-   * Trigger: user click / focus / keydown near chat composer
-   *
-   * 方針:
-   * - クリック後に「現在の composer」を再探索してから開く
-   * - クリック対象が wrapper でも動くようにする
-   * - ただしループ防止のため cooldown を入れる
-   **********************************************************************/
+  if (window.__gchatFormatDebugInstalled) {
+    console.info('[gchat-format-debug] already installed');
+    return;
+  }
+  window.__gchatFormatDebugInstalled = true;
 
-  const DEBUG = false;
-  const LOG_PREFIX = '[GChatFormatAutoOpen]';
+  const PREFIX = '[gchat-format-debug]';
+  const LOG_COOLDOWN_MS = 1000;
+  const SEARCH_MARGIN = 260;
+  const MAX_CANDIDATES = 20;
 
-  const POST_CLICK_DELAY_MS = 120;
-  const COOLDOWN_MS = 900;
+  let lastLogAt = 0;
+  let lastSignature = '';
+  let seq = 0;
 
-  let lastAutoOpenAt = 0;
-  let lastHandledComposerRoot = null;
-
-  function log(...args) {
-    if (DEBUG) {
-      console.log(LOG_PREFIX, ...args);
-    }
+  function isGoogleChat() {
+    return location.hostname === 'chat.google.com';
   }
 
-  function normalizeText(value) {
-    return (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  function text(value) {
+    return (value || '').replace(/\s+/g, ' ').trim();
   }
 
   function isVisible(el) {
-    if (!(el instanceof HTMLElement)) return false;
-
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-    if (el.offsetWidth <= 0 || el.offsetHeight <= 0) return false;
-
-    return true;
+    if (!(el instanceof Element)) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
   }
 
-  /**
-   * 現在アクティブな composer を探す。
-   * まず activeElement ベースで探し、
-   * ダメなら visible な textbox/contenteditable 候補の末尾を採用する。
-   */
-  function findCurrentComposer() {
-    const active = document.activeElement;
-
-    if (active instanceof HTMLElement) {
-      const fromActive = active.closest(
-        '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
-      );
-      if (fromActive instanceof HTMLElement && isVisible(fromActive)) {
-        return fromActive;
-      }
+  function isTextboxLike(el) {
+    if (!(el instanceof Element)) {
+      return false;
     }
 
-    const candidates = Array.from(
-      document.querySelectorAll(
-        '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
-      )
-    ).filter((el) => el instanceof HTMLElement && isVisible(el));
-
-    if (candidates.length === 0) return null;
-
-    return candidates[candidates.length - 1];
-  }
-
-  /**
-   * composer 周辺の入力エリア root を探す。
-   */
-  function findComposerRoot(composer) {
-    if (!(composer instanceof HTMLElement)) return null;
-
-    let node = composer;
-
-    for (let i = 0; i < 8 && node; i += 1) {
-      const parent = node.parentElement;
-      if (!parent) break;
-
-      const width = parent.offsetWidth;
-      const buttonCount = parent.querySelectorAll('button, [role="button"]').length;
-
-      if (width > 220 && buttonCount >= 2) {
-        node = parent;
-      } else {
-        break;
-      }
-    }
-
-    return node;
-  }
-
-  /**
-   * Google Chat の書式設定ボタン判定。
-   * 将来文言変更があれば keywords を修正。
-   */
-  function isLikelyFormatButton(el) {
-    if (!(el instanceof HTMLElement)) return false;
-    if (!isVisible(el)) return false;
-
-    const role = el.getAttribute('role');
-    const isButtonLike =
-      el.tagName === 'BUTTON' ||
-      role === 'button' ||
-      typeof el.click === 'function';
-
-    if (!isButtonLike) return false;
-
-    const texts = [
-      el.getAttribute('aria-label'),
-      el.getAttribute('title'),
-      el.getAttribute('data-tooltip'),
-      el.textContent
-    ]
-      .filter(Boolean)
-      .map(normalizeText);
-
-    const keywords = [
-      '書式設定',
-      'format',
-      'format options',
-      'formatting',
-      'format message'
-    ];
-
-    return texts.some((text) => keywords.some((keyword) => text.includes(keyword)));
-  }
-
-  function findFormatButtonInRoot(root) {
-    if (!(root instanceof HTMLElement)) return null;
-
-    const selector = [
-      'button[aria-label]',
-      'button[title]',
-      'button[data-tooltip]',
-      '[role="button"][aria-label]',
-      '[role="button"][title]',
-      '[role="button"][data-tooltip]'
-    ].join(',');
-
-    const buttons = Array.from(root.querySelectorAll(selector)).filter(isLikelyFormatButton);
-
-    buttons.sort((a, b) => {
-      const aScore = a.hasAttribute('aria-expanded') ? 1 : 0;
-      const bScore = b.hasAttribute('aria-expanded') ? 1 : 0;
-      return bScore - aScore;
-    });
-
-    return buttons[0] || null;
-  }
-
-  /**
-   * 既に書式ツールバーが開いているかを推定。
-   */
-  function isToolbarLikelyOpen(root, button) {
-    if (!(root instanceof HTMLElement)) return false;
-
-    if (button instanceof HTMLElement) {
-      const expanded = button.getAttribute('aria-expanded');
-      if (expanded === 'true') return true;
-
-      const controlsId = button.getAttribute('aria-controls');
-      if (controlsId) {
-        const controlled = document.getElementById(controlsId);
-        if (controlled && isVisible(controlled)) {
-          return true;
-        }
-      }
-    }
-
-    const toolbar = root.querySelector('[role="toolbar"]');
-    if (toolbar && isVisible(toolbar)) {
-      return true;
-    }
-
-    const formattingButtons = Array.from(root.querySelectorAll('button,[role="button"]')).filter((el) => {
-      if (el === button) return false;
-      if (!(el instanceof HTMLElement) || !isVisible(el)) return false;
-
-      const label = normalizeText(
-        el.getAttribute('aria-label') ||
-        el.getAttribute('title') ||
-        el.getAttribute('data-tooltip') ||
-        el.textContent
-      );
-
-      return [
-        'bold', 'italic', 'underline',
-        '太字', '斜体', '下線',
-        'bulleted', 'numbered',
-        '箇条書き', '番号付き'
-      ].some((keyword) => label.includes(keyword));
-    });
-
-    return formattingButtons.length >= 2;
-  }
-
-  function isCooldownActive(root) {
-    const now = Date.now();
-
-    if (now - lastAutoOpenAt < COOLDOWN_MS) {
-      return true;
-    }
-
-    if (lastHandledComposerRoot && root === lastHandledComposerRoot && now - lastAutoOpenAt < COOLDOWN_MS * 2) {
+    if (el.matches('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]')) {
       return true;
     }
 
     return false;
   }
 
-  function tryOpenToolbarFromCurrentComposer() {
-    const composer = findCurrentComposer();
-    if (!(composer instanceof HTMLElement)) {
-      log('No current composer found.');
-      return;
+  function findTextboxFromTarget(target) {
+    if (!(target instanceof Element)) {
+      return null;
     }
 
-    const root = findComposerRoot(composer) || composer;
-    if (!(root instanceof HTMLElement)) return;
-
-    const button = findFormatButtonInRoot(root);
-    if (!(button instanceof HTMLElement)) {
-      log('No format button found near current composer.');
-      return;
+    const direct = target.closest('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]');
+    if (direct) {
+      return direct;
     }
 
-    if (isToolbarLikelyOpen(root, button)) {
-      log('Toolbar already open.');
-      return;
-    }
+    const nearbyTextboxes = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]')]
+      .filter(isVisible)
+      .map((el) => ({
+        el,
+        distance: distanceBetween(el.getBoundingClientRect(), target.getBoundingClientRect()),
+      }))
+      .sort((a, b) => a.distance - b.distance);
 
-    if (isCooldownActive(root)) {
-      log('Cooldown active.');
-      return;
-    }
-
-    lastAutoOpenAt = Date.now();
-    lastHandledComposerRoot = root;
-
-    log('Clicking format button.', {
-      label: button.getAttribute('aria-label') || button.getAttribute('title')
-    });
-
-    button.click();
+    return nearbyTextboxes[0]?.distance <= SEARCH_MARGIN ? nearbyTextboxes[0].el : null;
   }
 
-  /**
-   * クリックや focus の後、少し待ってから composer を再探索する。
-   * これで wrapperクリックでも反応しやすくなる。
-   */
-  function scheduleTryOpen() {
+  function findComposerRoot(textbox) {
+    if (!(textbox instanceof Element)) {
+      return null;
+    }
+
+    let node = textbox;
+    for (let i = 0; i < 6 && node; i += 1) {
+      const buttonCount = node.querySelectorAll('button, [role="button"]').length;
+      const textboxCount = node.querySelectorAll('[contenteditable="true"], textarea, input[type="text"], input:not([type]), [role="textbox"]').length;
+      if (buttonCount > 0 && textboxCount > 0) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+
+    return textbox.parentElement || textbox;
+  }
+
+  function distanceBetween(a, b) {
+    const ax = a.left + a.width / 2;
+    const ay = a.top + a.height / 2;
+    const bx = b.left + b.width / 2;
+    const by = b.top + b.height / 2;
+    const dx = ax - bx;
+    const dy = ay - by;
+    return Math.round(Math.sqrt(dx * dx + dy * dy));
+  }
+
+  function intersectsExpandedRect(baseRect, candidateRect, margin = SEARCH_MARGIN) {
+    return !(
+      candidateRect.right < baseRect.left - margin ||
+      candidateRect.left > baseRect.right + margin ||
+      candidateRect.bottom < baseRect.top - margin ||
+      candidateRect.top > baseRect.bottom + margin
+    );
+  }
+
+  function scoreCandidate(button, textboxRect) {
+    const label = text(button.getAttribute('aria-label'));
+    const title = text(button.getAttribute('title'));
+    const tooltip = text(button.getAttribute('data-tooltip'));
+    const bodyText = text(button.innerText || button.textContent || '');
+    const expanded = text(button.getAttribute('aria-expanded'));
+    const controls = text(button.getAttribute('aria-controls'));
+    const combined = `${label} ${title} ${tooltip} ${bodyText}`.toLowerCase();
+    const rect = button.getBoundingClientRect();
+    const distance = distanceBetween(textboxRect, rect);
+
+    let score = 0;
+    if (bodyText === 'A' || bodyText === 'a') score += 8;
+    if (/format|formatting|書式|書式設定|style/.test(combined)) score += 8;
+    if (expanded) score += 3;
+    if (controls) score += 3;
+    if (button.getAttribute('aria-haspopup')) score += 1;
+    score += Math.max(0, 6 - Math.floor(distance / 80));
+
+    return {
+      score,
+      distance,
+      text: bodyText,
+      ariaLabel: label,
+      title,
+      dataTooltip: tooltip,
+      ariaExpanded: expanded,
+      ariaControls: controls,
+      ariaHaspopup: text(button.getAttribute('aria-haspopup')),
+      rect: `${Math.round(rect.left)},${Math.round(rect.top)} ${Math.round(rect.width)}x${Math.round(rect.height)}`,
+      tag: button.tagName.toLowerCase(),
+      role: text(button.getAttribute('role')),
+      className: text(button.className),
+      button,
+    };
+  }
+
+  function collectCandidates(textbox, composerRoot) {
+    const textboxRect = textbox.getBoundingClientRect();
+    const scope = composerRoot || document.body;
+    const buttons = [...scope.querySelectorAll('button, [role="button"]')]
+      .filter(isVisible)
+      .filter((button) => intersectsExpandedRect(textboxRect, button.getBoundingClientRect()))
+      .map((button) => scoreCandidate(button, textboxRect))
+      .sort((a, b) => b.score - a.score || a.distance - b.distance)
+      .slice(0, MAX_CANDIDATES);
+
+    return buttons;
+  }
+
+  function makeSignature(textbox, composerRoot) {
+    const textboxRect = textbox.getBoundingClientRect();
+    const rootTag = composerRoot?.tagName?.toLowerCase() || 'none';
+    return [
+      location.pathname,
+      rootTag,
+      Math.round(textboxRect.left),
+      Math.round(textboxRect.top),
+      Math.round(textboxRect.width),
+      Math.round(textboxRect.height),
+    ].join('|');
+  }
+
+  function shouldLog(signature) {
+    const now = Date.now();
+    if (signature === lastSignature && now - lastLogAt < LOG_COOLDOWN_MS) {
+      return false;
+    }
+    lastSignature = signature;
+    lastLogAt = now;
+    return true;
+  }
+
+  function debugComposer(target, trigger) {
+    if (!isGoogleChat()) {
+      return;
+    }
+
+    const textbox = findTextboxFromTarget(target);
+    if (!textbox || !isTextboxLike(textbox)) {
+      return;
+    }
+
+    const composerRoot = findComposerRoot(textbox);
+    const signature = makeSignature(textbox, composerRoot);
+    if (!shouldLog(signature)) {
+      return;
+    }
+
+    const candidates = collectCandidates(textbox, composerRoot);
+    const textboxRect = textbox.getBoundingClientRect();
+
+    seq += 1;
+    console.group(`${PREFIX} #${seq} ${trigger}`);
+    console.info('url:', location.href);
+    console.info('textbox:', textbox);
+    console.info('composerRoot:', composerRoot);
+    console.info('textboxRect:', `${Math.round(textboxRect.left)},${Math.round(textboxRect.top)} ${Math.round(textboxRect.width)}x${Math.round(textboxRect.height)}`);
+    console.table(candidates.map((item) => ({
+      score: item.score,
+      distance: item.distance,
+      text: item.text,
+      ariaLabel: item.ariaLabel,
+      title: item.title,
+      dataTooltip: item.dataTooltip,
+      ariaExpanded: item.ariaExpanded,
+      ariaControls: item.ariaControls,
+      ariaHaspopup: item.ariaHaspopup,
+      rect: item.rect,
+      tag: item.tag,
+      role: item.role,
+      className: item.className,
+    })));
+    console.groupEnd();
+
+    window.__gchatFormatDebugLast = {
+      at: new Date().toISOString(),
+      trigger,
+      url: location.href,
+      textbox,
+      composerRoot,
+      candidates: candidates.map(({ button, ...rest }) => rest),
+    };
+  }
+
+  function onInteraction(event) {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+
     window.setTimeout(() => {
-      tryOpenToolbarFromCurrentComposer();
-    }, POST_CLICK_DELAY_MS);
+      debugComposer(target, event.type);
+    }, 120);
   }
 
-  function boot() {
-    log('Booting click-triggered Google Chat format opener.');
+  document.addEventListener('click', onInteraction, true);
+  document.addEventListener('focusin', onInteraction, true);
 
-    document.addEventListener(
-      'click',
-      () => {
-        scheduleTryOpen();
-      },
-      true
-    );
-
-    document.addEventListener(
-      'focusin',
-      () => {
-        scheduleTryOpen();
-      },
-      true
-    );
-
-    document.addEventListener(
-      'keydown',
-      (event) => {
-        const target = event.target;
-        if (!(target instanceof HTMLElement)) return;
-
-        const isInputLike = !!target.closest(
-          '[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'
-        );
-
-        if (isInputLike) {
-          scheduleTryOpen();
-        }
-      },
-      true
-    );
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot, { once: true });
-  } else {
-    boot();
-  }
+  console.info(`${PREFIX} installed for ${location.href}`);
 })();
